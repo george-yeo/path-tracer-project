@@ -1,0 +1,247 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Unidirectional path tracer with next-event estimation and multiple importance sampling.
+// Each invocation traces pc.sampleCount paths through one pixel and adds them to the
+// accumulation image; resolve.comp turns the running sum into a displayable image.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "common.glsl"
+#include "scene.glsl"
+#include "random.glsl"
+#include "sampling.glsl"
+#include "bsdf.glsl"
+#include "intersect.glsl"
+
+struct SurfaceHit {
+    vec3 position;
+    vec3 geometricNormal; // faces the incoming ray
+    vec3 shadingNormal;   // in the same hemisphere as geometricNormal
+    float distance;
+    uint material;
+    uint lightIndex;      // NO_LIGHT unless this is an emissive triangle in the light table
+    bool frontFace;       // ray hit the side the triangle's winding faces (the emitting side)
+};
+
+bool traceScene(Ray ray, out SurfaceHit hit) {
+    float tMax = INF;
+    uint triangle;
+    vec2 uv;
+    bool hitTriangle = traverseBvh(ray, false, tMax, triangle, uv);
+
+    int sphere = -1;
+    for (uint i = 0u; i < pc.sphereCount; ++i) {
+        float t;
+        if (intersectSphere(ray, spheres[i], tMax, t)) {
+            tMax = t;
+            sphere = int(i);
+        }
+    }
+
+    vec3 geometric;
+    if (sphere >= 0) {
+        Sphere s = spheres[sphere];
+        hit.position = ray.origin + ray.direction * tMax;
+        geometric = (hit.position - s.center) / s.radius;
+        hit.shadingNormal = geometric;
+        hit.material = s.material;
+        hit.lightIndex = NO_LIGHT;
+    } else if (hitTriangle) {
+        Triangle tri = triangles[triangle];
+        TriangleShading sh = shading[triangle];
+        hit.position = ray.origin + ray.direction * tMax;
+        geometric = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+        hit.shadingNormal = normalize((1.0 - uv.x - uv.y) * sh.n0 + uv.x * sh.n1 + uv.y * sh.n2);
+        hit.material = sh.material;
+        hit.lightIndex = sh.lightIndex;
+    } else {
+        return false;
+    }
+
+    hit.distance = tMax;
+    hit.frontFace = dot(geometric, ray.direction) < 0.0;
+    hit.geometricNormal = hit.frontFace ? geometric : -geometric;
+    if (dot(hit.shadingNormal, hit.geometricNormal) < 0.0) {
+        hit.shadingNormal = -hit.shadingNormal;
+    }
+    return true;
+}
+
+// Offset along the geometric normal, scaled with distance from the origin to stay above
+// float precision for both the Cornell box (units ~1) and the studio scenes (units ~100).
+vec3 offsetOrigin(vec3 p, vec3 n) {
+    float scale = max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))));
+    return p + n * (1e-4 * scale);
+}
+
+float triangleArea(Triangle tri) {
+    return 0.5 * length(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+}
+
+// Solid-angle pdf of next-event estimation choosing a point on light `index` seen at
+// `distance` with cosine `cosLight` at the light: pmf * d^2 / (area * cos).
+float lightPdf(uint index, float distance, float cosLight) {
+    Light light = lights[index];
+    return light.pmf * distance * distance / (triangleArea(triangles[light.triangle]) * cosLight);
+}
+
+// O(1) power-proportional light selection with the alias table built in SceneCompiler.
+uint sampleLightIndex(vec2 u) {
+    uint i = min(uint(u.x * float(pc.lightCount)), pc.lightCount - 1u);
+    return u.y < lights[i].aliasThreshold ? i : lights[i].alias;
+}
+
+// Next-event estimation: one shadow ray to a point on one emissive triangle.
+vec3 sampleDirectLight(Bsdf bsdf, SurfaceHit hit, vec3 V, vec3 origin) {
+    uint index = sampleLightIndex(rand2());
+    Light light = lights[index];
+    Triangle tri = triangles[light.triangle];
+
+    vec3 point = sampleTriangle(tri.v0, tri.v1, tri.v2, rand2());
+    vec3 lightNormal = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+    vec3 toLight = point - origin;
+    float distance = length(toLight);
+    vec3 wi = toLight / distance;
+
+    float cosLight = dot(lightNormal, -wi); // emitters are one-sided
+    float cosSurface = dot(hit.shadingNormal, wi);
+    if (cosLight <= 0.0 || cosSurface <= 0.0 || dot(wi, hit.geometricNormal) <= 0.0) {
+        return vec3(0.0);
+    }
+
+    vec3 f = evalBsdf(bsdf, hit.shadingNormal, V, wi);
+    if (f == vec3(0.0) || occluded(Ray(origin, wi), distance * 0.999)) {
+        return vec3(0.0);
+    }
+
+    float pdfLight = lightPdf(index, distance, cosLight);
+    float weight = pc.integrator == INTEGRATOR_MIS
+                       ? powerHeuristic(pdfLight, pdfBsdf(bsdf, hit.shadingNormal, V, wi))
+                       : 1.0;
+    vec3 emission = materials[shading[light.triangle].material].emission;
+    return f * emission * (cosSurface * weight / pdfLight);
+}
+
+vec3 tracePath(Ray ray) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    float previousBsdfPdf = 0.0;
+
+    for (uint depth = 0u;; ++depth) {
+        SurfaceHit hit;
+        if (!traceScene(ray, hit)) {
+            radiance += throughput * pc.sky.rgb; // constant environment, BSDF-sampled only
+            break;
+        }
+
+        Material material = materials[hit.material];
+
+        // Emission reached by BSDF sampling. If the emitter is also reachable by next-event
+        // estimation, weight this strategy so the two combine without double counting.
+        if (hit.frontFace && material.emission != vec3(0.0)) {
+            float weight = 1.0;
+            if (depth > 0u && hit.lightIndex != NO_LIGHT) {
+                if (pc.integrator == INTEGRATOR_LIGHT) {
+                    weight = 0.0; // NEE already accounts for it
+                } else if (pc.integrator == INTEGRATOR_MIS) {
+                    float cosLight = dot(hit.geometricNormal, -ray.direction);
+                    weight = powerHeuristic(previousBsdfPdf,
+                                            lightPdf(hit.lightIndex, hit.distance, cosLight));
+                }
+            }
+            radiance += throughput * material.emission * weight;
+        }
+
+        if (depth >= pc.maxBounces) {
+            break;
+        }
+
+        vec3 V = -ray.direction;
+        if (dot(hit.shadingNormal, V) <= 0.0) {
+            hit.shadingNormal = hit.geometricNormal; // interpolated normal faces away from viewer
+        }
+        Bsdf bsdf = makeBsdf(material, dot(hit.shadingNormal, V));
+        vec3 origin = offsetOrigin(hit.position, hit.geometricNormal);
+
+        if (pc.lightCount > 0u && pc.integrator != INTEGRATOR_BSDF) {
+            radiance += throughput * sampleDirectLight(bsdf, hit, V, origin);
+        }
+
+        vec3 L;
+        if (!sampleBsdf(bsdf, hit.shadingNormal, V, vec3(rand(), rand2()), L) ||
+            dot(L, hit.geometricNormal) <= 0.0) {
+            break;
+        }
+        float pdf = pdfBsdf(bsdf, hit.shadingNormal, V, L);
+        if (pdf <= 0.0) {
+            break;
+        }
+        // Estimator weight f * cos / pdf with the pdf of the lobe mixture actually sampled.
+        // (Previously: F * G1 for both lobes, which dropped the diffuse albedo on indirect
+        // bounces and was inconsistent with the MIS pdfs.)
+        throughput *= evalBsdf(bsdf, hit.shadingNormal, V, L) * (dot(hit.shadingNormal, L) / pdf);
+        previousBsdfPdf = pdf;
+        ray = Ray(origin, L);
+
+        // Russian roulette (the old version only started at bounce 7 of 4, i.e. never).
+        if (depth >= 3u) {
+            float survive = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            if (rand() >= survive) {
+                break;
+            }
+            throughput /= survive;
+        }
+    }
+    return radiance;
+}
+
+vec3 heatColor(float t) {
+    t = clamp(t, 0.0, 1.0);
+    return clamp(vec3(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)),
+                 0.0, 1.0);
+}
+
+vec3 bvhHeatmap(Ray ray) {
+    bvhNodesVisited = 0u;
+    float tMax = INF;
+    uint triangle;
+    vec2 uv;
+    traverseBvh(ray, false, tMax, triangle, uv);
+    return heatColor(float(bvhNodesVisited) / 128.0);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uvec2 size = uvec2(imageSize(accumulationImage));
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    float tanHalfFov = pc.cameraPosition.w;
+    float aspect = pc.cameraRight.w;
+
+    vec3 sum = vec3(0.0);
+    for (uint s = 0u; s < pc.sampleCount; ++s) {
+        seedRng(pixel, pc.sampleIndex + s);
+
+        // Jittered sub-pixel position; y flipped so row 0 is the top of the image.
+        vec2 ndc = (vec2(pixel) + rand2()) / vec2(size) * 2.0 - 1.0;
+        vec3 direction = normalize(pc.cameraForward.xyz +
+                                   ndc.x * aspect * tanHalfFov * pc.cameraRight.xyz -
+                                   ndc.y * tanHalfFov * pc.cameraUp.xyz);
+        Ray ray = Ray(pc.cameraPosition.xyz, direction);
+
+        vec3 color = pc.integrator == INTEGRATOR_HEATMAP ? bvhHeatmap(ray) : tracePath(ray);
+        // A NaN/Inf would poison this pixel for the rest of accumulation; drop the sample.
+        if (any(isnan(color)) || any(isinf(color))) {
+            color = vec3(0.0);
+        }
+        sum += color;
+    }
+
+    if (pc.sampleIndex > 0u) {
+        sum += imageLoad(accumulationImage, ivec2(pixel)).rgb;
+    }
+    imageStore(accumulationImage, ivec2(pixel), vec4(sum, 1.0));
+}

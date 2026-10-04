@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Accumulated radiance -> display: average, expose, ACES tone map, encode.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "common.glsl"
+
+// Narkowicz's ACES filmic fit.
+vec3 acesFilm(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+// Exact sRGB transfer function (the old shader approximated it with pow(1/2.2)).
+vec3 linearToSrgb(vec3 c) {
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, lessThanEqual(c, vec3(0.0031308)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(displayImage);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    vec3 color = vec3(0.0);
+    if (pc.sampleCount > 0u) {
+        color = imageLoad(accumulationImage, pixel).rgb / float(pc.sampleCount);
+    }
+
+    if ((pc.flags & FLAG_RAW_OUTPUT) == 0u) {
+        color = acesFilm(color * pc.exposure);
+        if ((pc.flags & FLAG_ENCODE_SRGB) != 0u) {
+            color = linearToSrgb(color);
+        }
+    }
+    imageStore(displayImage, pixel, vec4(clamp(color, 0.0, 1.0), 1.0));
+}

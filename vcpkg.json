@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "path-tracer",
+  "version-string": "1.0.0",
+  "description": "Progressive GPU path tracer in C++20 and Vulkan compute",
+  "dependencies": [
+    "glfw3",
+    "glm",
+    "stb",
+    "vulkan-memory-allocator"
+  ],
+  "builtin-baseline": "a1cae005c39be7b18ba319fced856b68d7276271"
+}

@@ -1,0 +1,14 @@
+# Matches the existing code style: 4-space indent, access specifiers at member indentation,
+# attached braces, 100 columns.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: 0
+PointerAlignment: Left
+IndentCaseLabels: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortLambdasOnASingleLine: Inline
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
